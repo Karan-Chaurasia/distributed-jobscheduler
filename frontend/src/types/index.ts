@@ -44,6 +44,23 @@ export interface Job {
   createdAt: string;
 }
 
+export type ExecutionStatus = "RUNNING" | "SUCCEEDED" | "FAILED" | "TIMED_OUT";
+
+export interface JobExecution {
+  id: string;
+  jobId: string;
+  workerId: string;
+  workerHostname?: string;
+  attemptNumber: number;
+  status: ExecutionStatus;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  errorMessage?: string;
+  resultPayload?: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface Queue {
   id: string;
   projectId: string;
@@ -78,9 +95,31 @@ export interface Organization {
 export interface Project {
   id: string;
   organizationId: string;
+  ownerId: string;
   name: string;
   slug: string;
   description?: string;
   status: string;
   createdAt: string;
+}
+
+export interface SystemMetrics {
+  jobsByStatus: Record<JobStatus, number>;
+  totalJobs: number;
+  totalQueues: number;
+  onlineWorkers: number;
+  totalWorkers: number;
+  deadLetterDepth: number;
+  completedTotal: number;
+  failedTotal: number;
+  deadLetteredTotal: number;
+  submittedTotal: number;
+}
+
+export interface CurrentUser {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  role: string;
 }

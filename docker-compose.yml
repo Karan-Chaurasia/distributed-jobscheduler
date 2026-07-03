@@ -1,5 +1,13 @@
-version: "3.9"
-
+# =============================================================================
+# Local infrastructure for the Distributed Job Scheduler.
+#
+# Only two services are needed:
+#   - postgres : primary datastore AND the job queue (claimed via SKIP LOCKED)
+#   - redis    : JWT blacklist + response cache
+#
+# The application and its embedded worker run on the host (mvn spring-boot:run)
+# or can be containerised separately. No message broker is required.
+# =============================================================================
 services:
   postgres:
     image: postgres:16-alpine
@@ -23,7 +31,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: scheduler-redis
-    command: redis-server --requirepass ${REDIS_PASSWORD:-}
+    # No password for local dev (matches REDIS_PASSWORD="" in .env.example).
+    # For a secured deployment, run: redis-server --requirepass "<your-password>"
     ports:
       - "6379:6379"
     volumes:
@@ -36,66 +45,9 @@ services:
     networks:
       - scheduler-net
 
-  rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    container_name: scheduler-rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
-      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-    networks:
-      - scheduler-net
-
-  prometheus:
-    image: prom/prometheus:v2.51.0
-    container_name: scheduler-prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
-      - "--web.console.templates=/usr/share/prometheus/consoles"
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    networks:
-      - scheduler-net
-
-  grafana:
-    image: grafana/grafana:10.4.0
-    container_name: scheduler-grafana
-    environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    depends_on:
-      - prometheus
-    networks:
-      - scheduler-net
-
 volumes:
   postgres_data:
   redis_data:
-  rabbitmq_data:
-  prometheus_data:
-  grafana_data:
 
 networks:
   scheduler-net:

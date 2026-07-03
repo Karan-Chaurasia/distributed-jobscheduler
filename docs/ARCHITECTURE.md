@@ -2,173 +2,157 @@
 
 ## 1. Design Principles
 
-- **Clean Architecture** — dependencies point inward; domain logic has zero framework dependencies
-- **Feature-based packaging** — each feature is a self-contained vertical slice
-- **SOLID** — single responsibility per class, interfaces for all services, constructor injection only
-- **DTOs at boundaries** — JPA entities never leave the service layer
-- **Centralized exception handling** — `GlobalExceptionHandler` translates domain exceptions to HTTP responses
+- **Clean, feature-based packaging** — each domain (auth, jobs, queue, worker, …) is a
+  self-contained vertical slice: controller → service → repository → entity/dto/mapper.
+- **Interfaces + constructor injection** — every service has an interface; no field injection.
+- **DTOs at boundaries** — JPA entities never leave the service layer; MapStruct maps to DTOs.
+- **Centralized error handling** — a `DomainException` hierarchy is translated to HTTP
+  responses by `GlobalExceptionHandler`, wrapped in a uniform `ApiResponse<T>` envelope.
+- **The database is the coordinator** — job state and the "queue" both live in Postgres.
+  Workers claim work with `SELECT … FOR UPDATE SKIP LOCKED`, which gives exactly-once
+  hand-off across any number of workers **without** a separate message broker.
 
 ---
 
-## 2. Backend Package Structure
+## 2. High-Level Architecture
+
+```
+                 ┌────────────────────────┐
+                 │  React + TypeScript UI  │   (Vite dev server :5173, proxies /api)
+                 └───────────┬────────────┘
+                             │ REST (JWT)
+                             ▼
+                 ┌────────────────────────┐
+                 │   Spring Boot service   │
+                 │  ┌──────────────────┐   │
+                 │  │  Control plane   │   │  REST API: auth, orgs, projects,
+                 │  │  (controllers)   │   │  queues, jobs, workers, metrics
+                 │  ├──────────────────┤   │
+                 │  │  Scheduler loops │   │  @Scheduled: promote due jobs,
+                 │  │                  │   │  materialise cron, reap stalled
+                 │  ├──────────────────┤   │
+                 │  │ Embedded worker  │   │  poll → claim (SKIP LOCKED) →
+                 │  │ (thread pool)    │   │  execute → complete/retry/DLQ
+                 │  └──────────────────┘   │
+                 └─────┬─────────────┬─────┘
+                       │ JDBC/JPA    │ Redis
+                       ▼             ▼
+              ┌────────────────┐  ┌──────────────────────┐
+              │   PostgreSQL   │  │        Redis         │
+              │  jobs (=queue) │  │  JWT blacklist,      │
+              │  executions    │  │  response cache      │
+              │  workers, DLQ  │  └──────────────────────┘
+              └────────────────┘
+```
+
+The worker is **embedded** in the same Spring Boot process by default (`scheduler.worker.enabled=true`).
+Because claiming is done atomically in the database, you scale out simply by starting more
+instances of the same jar — they compete for jobs safely. Set `scheduler.worker.enabled=false`
+to run an API-only (control-plane) node.
+
+---
+
+## 3. Backend Package Structure
 
 ```
 com.scheduler
-├── DistributedJobSchedulerApplication.java
-│
-├── common/                        # Cross-cutting concerns
-│   ├── audit/                     # BaseEntity, AuditConfig (JPA auditing)
-│   ├── config/                    # SecurityConfig, RedisConfig, RabbitMQConfig,
-│   │                              #   WebSocketConfig, OpenApiConfig
-│   ├── exception/                 # DomainException hierarchy, GlobalExceptionHandler
-│   ├── response/                  # ApiResponse<T>, PagedResponse<T>
-│   ├── security/                  # JWT filter, token service (TODO)
-│   └── util/                      # Shared utilities (TODO)
-│
-├── auth/                          # Authentication & token management
-│   ├── controller/AuthController
-│   ├── service/AuthService + AuthServiceImpl
-│   └── dto/LoginRequest, RegisterRequest, AuthResponse, RefreshTokenRequest
-│
-├── users/                         # User management
-│   ├── controller/UserController
-│   ├── service/UserService + UserServiceImpl
-│   ├── repository/UserRepository
-│   ├── entity/User + enums/
-│   ├── dto/UserDto, UpdateUserRequest
-│   └── mapper/UserMapper
-│
-├── organization/                  # Organization management
-│   ├── controller/OrganizationController
-│   ├── service/OrganizationService + OrganizationServiceImpl
-│   ├── repository/OrganizationRepository
-│   ├── entity/Organization, OrganizationStatus
-│   ├── dto/OrganizationDto, CreateOrganizationRequest
-│   └── mapper/OrganizationMapper
-│
-├── project/                       # Project management
-│   └── (same structure as organization)
-│
-├── queue/                         # Job queue management
-│   └── (same structure, adds pause/resume)
-│
-├── jobs/                          # Job lifecycle
-│   ├── entity/Job + enums/JobStatus, JobType
-│   └── (submit, cancel, retry operations)
-│
-├── worker/                        # Worker registration & heartbeats
-│   └── (register, heartbeat, dead worker detection)
-│
-├── scheduler/                     # Cron-driven dispatching
-│   └── service/JobSchedulerServiceImpl  (@Scheduled methods)
-│
-├── retry/                         # Retry policy per queue
-│   └── entity/RetryPolicy, BackoffStrategy
-│
-├── metrics/                       # Aggregated metrics
-│   └── (job counts, worker stats per queue/project)
-│
-└── websocket/                     # Real-time push notifications
-    └── service/WebSocketNotificationService
+├── common/          # BaseEntity, SecurityConfig/JWT, exception handling,
+│                    #   ApiResponse/PagedResponse, JobMetrics, SchedulingConfig
+├── auth/            # register / login / refresh (rotation) / logout (blacklist)
+├── users/           # user CRUD
+├── organization/    # org CRUD + owner membership
+├── project/         # project CRUD (org-scoped)
+├── queue/           # queue CRUD + pause/resume + concurrency/retry config
+├── retry/           # RetryPolicy CRUD + backoff calculation (FIXED/LINEAR/EXPONENTIAL)
+├── jobs/            # Job lifecycle
+│   ├── service/JobServiceImpl          # submit / cancel / retry / executions / DLQ
+│   └── service/JobExecutionService     # atomic claim + success/failure transitions
+├── worker/
+│   ├── service/WorkerServiceImpl       # register / heartbeat / deregister / dead detection
+│   └── runtime/EmbeddedWorker          # poll loop, executor pool, graceful shutdown
+├── scheduler/       # @Scheduled dispatch loops (due, cron, reaper)
+└── metrics/         # aggregated dashboard metrics endpoint
 ```
 
 ---
 
-## 3. Data Flow
+## 4. Job Lifecycle
 
-### Job Submission
 ```
-Client → POST /api/jobs
-  → JobController.submit()
-  → JobServiceImpl.submit()
-    → Validate queue exists & is ACTIVE
-    → Persist Job (status=PENDING)
-    → Publish message to RabbitMQ jobs.exchange
-    → Update job status to QUEUED
-  → Return JobDto
-```
-
-### Job Execution (Worker)
-```
-RabbitMQ → Worker consumes message
-  → Worker updates job status to RUNNING
-  → Worker sends heartbeat every 30s
-  → On success: status=COMPLETED, notify via WebSocket
-  → On failure: status=FAILED, increment attemptCount
-    → If attemptCount < maxAttempts: re-queue with backoff delay
-    → If attemptCount >= maxAttempts: status=DEAD, route to DLQ
+ submit ──▶ QUEUED ──▶ (worker claims) ──▶ RUNNING ──▶ COMPLETED
+   │           ▲                                  │
+   │ delayed/  │ scheduler promotes when due      │ on failure
+   ▼ scheduled │                                  ▼
+ PENDING ──────┘                     attempts left?  ── yes ─▶ RETRYING ─(backoff elapsed)─┐
+                                             │ no                                          │
+                                             ▼                                             │
+                                           DEAD  ──▶ dead_letter_entries          (scheduler promotes)
+                                                                                           │
+ any non-terminal state ──▶ CANCELLED                     QUEUED ◀───────────────────────┘
 ```
 
-### Scheduler Loop
-```
-@Scheduled(fixedDelay=5s)
-  → Query PENDING jobs WHERE scheduledAt <= NOW()
-  → Publish to RabbitMQ
-  → Update status to QUEUED
+### Atomic claim (the core of the concurrency model)
 
-@Scheduled(fixedDelay=10s)
-  → Evaluate CRON jobs
-  → Create Job instances for due cron expressions
-  → Publish to RabbitMQ
-
-@Scheduled(fixedDelay=30s)
-  → Detect RUNNING jobs with no heartbeat > 90s
-  → Mark as FAILED, trigger retry logic
+```sql
+SELECT j.* FROM jobs j
+JOIN job_queues q ON q.id = j.queue_id
+WHERE j.status = 'QUEUED'
+  AND j.scheduled_at <= now()
+  AND q.status = 'ACTIVE'                                  -- pause/resume
+  AND (SELECT count(*) FROM jobs r
+         WHERE r.queue_id = j.queue_id
+           AND r.status = 'RUNNING') < q.concurrency       -- per-queue concurrency limit
+ORDER BY j.priority DESC, j.scheduled_at ASC               -- priority + FIFO
+LIMIT :limit
+FOR UPDATE OF j SKIP LOCKED;                               -- no two workers get the same job
 ```
+
+The worker flips the returned rows to `RUNNING` inside the *same* transaction, so the lock
+is released holding the new state. Job execution then runs on a bounded thread pool
+**outside** the transaction — a slow job never holds a row lock or DB connection.
+
+### Scheduler loops (`scheduler` package)
+
+| Loop | Default cadence | Responsibility |
+|------|-----------------|----------------|
+| `dispatchDueJobs` | 5s  | `UPDATE … SET status='QUEUED'` for PENDING/RETRYING jobs whose `scheduled_at <= now()` |
+| `dispatchCronJobs` | 10s | materialise concrete `Job` rows from due `scheduled_jobs` (cron) definitions |
+| `reapStalledJobs`  | 30s | mark workers that missed heartbeats as DEAD; requeue the RUNNING jobs they held |
 
 ---
 
-## 4. Infrastructure
+## 5. Reliability & Concurrency
 
-| Service    | Port  | Purpose                              |
-|------------|-------|--------------------------------------|
-| Backend    | 8080  | REST API + WebSocket                 |
-| PostgreSQL | 5432  | Persistent job/worker metadata       |
-| Redis      | 6379  | Distributed locks, token blacklist   |
-| RabbitMQ   | 5672  | Job message broker                   |
-| RabbitMQ   | 15672 | Management UI                        |
-| Prometheus | 9090  | Metrics scraping                     |
-| Grafana    | 3000  | Metrics dashboards                   |
-| Frontend   | 5173  | React dev server                     |
-
----
-
-## 5. RabbitMQ Topology
-
-```
-jobs.exchange (Direct)
-  ├── jobs.default.routing-key  →  jobs.default.queue
-  └── jobs.delayed.routing-key  →  jobs.delayed.queue
-
-Both queues have:
-  x-dead-letter-exchange    = jobs.dlx.exchange
-  x-dead-letter-routing-key = jobs.dlq.queue
-
-jobs.dlx.exchange (Direct)
-  └── jobs.dlq.queue  (Dead Letter Queue)
-```
+- **No duplicate execution** — `FOR UPDATE SKIP LOCKED` guarantees a QUEUED row is handed to
+  exactly one worker.
+- **Crash recovery** — the reaper requeues jobs orphaned by a worker that stopped
+  heart-beating, so no work is silently lost.
+- **Backoff & DLQ** — failures are retried with FIXED / LINEAR / EXPONENTIAL backoff (with
+  optional jitter) until `max_attempts`, after which the job is dead-lettered for inspection/replay.
+- **Graceful shutdown** — on SIGTERM the worker stops claiming, drains in-flight jobs
+  (up to 30s), then deregisters.
+- **Idempotent transitions** — each state change is a short transaction reloading the row by id.
 
 ---
 
-## 6. Security
+## 6. Infrastructure
 
-- Stateless JWT authentication (access + refresh tokens)
-- Refresh tokens stored in Redis with TTL
-- Token blacklisting on logout via Redis
-- Method-level security with `@PreAuthorize`
-- Roles: `ADMIN`, `ORG_OWNER`, `ORG_MEMBER`, `USER`
+| Service    | Port | Purpose |
+|------------|------|---------|
+| Backend    | 8080 | REST API + embedded worker + `/actuator/prometheus` |
+| PostgreSQL | 5432 | System of record **and** the job queue |
+| Redis      | 6379 | JWT blacklist + response cache |
+| Frontend   | 5173 | React (Vite) dev server |
+
+No message broker is required. Metrics are exposed via Micrometer at
+`/actuator/prometheus` and aggregated for the dashboard at `/api/metrics/overview`.
 
 ---
 
-## 7. Feature Implementation Order (Suggested)
+## 7. Security
 
-1. `auth` — JWT filter, login, register, refresh
-2. `users` — profile management
-3. `organization` + `project` — multi-tenancy
-4. `queue` — queue CRUD + pause/resume
-5. `jobs` — submit, cancel, retry + RabbitMQ publishing
-6. `worker` — registration, heartbeat, dead detection
-7. `scheduler` — cron dispatch, stalled job reaping
-8. `retry` — backoff calculation, DLQ handling
-9. `metrics` — aggregation + Micrometer counters
-10. `websocket` — real-time job status push
+- Stateless JWT (access + refresh) with refresh-token rotation.
+- Logout blacklists the access token (Redis); password change revokes all sessions.
+- Role-based access control at the URL and method level.
+  Roles: `ADMIN`, `PROJECT_ADMIN`, `DEVELOPER`, `VIEWER`.
+- The first user to register is bootstrapped as `ADMIN`; subsequent users are `DEVELOPER`.

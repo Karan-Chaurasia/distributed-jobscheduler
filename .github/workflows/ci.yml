@@ -25,7 +25,7 @@ jobs:
           cache: maven
 
       - name: Build and test
-        run: mvn clean verify -P test
+        run: mvn -B clean verify
 
   frontend:
     name: Frontend Build
